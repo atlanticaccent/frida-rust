@@ -4,7 +4,7 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-use frida_sys::_FridaDevice;
+use frida_sys::{_FridaDevice, _GBytes};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
@@ -269,6 +269,27 @@ impl<'a> Device<'a> {
 
         Ok(())
     }
+
+    /// Add child process output listener to the device
+    pub fn add_output_listener<L: OutputListener>(&self, _: L) {
+        unsafe {
+            const OUTPUT_SIGNAL: *const std::ffi::c_char =
+                unsafe { CStr::from_bytes_with_nul_unchecked(b"output\0").as_ptr() };
+
+            let callback = Some(std::mem::transmute(
+                on_output_impl::<L> as *mut std::ffi::c_void,
+            ));
+
+            frida_sys::g_signal_connect_data(
+                self.device_ptr as _,
+                OUTPUT_SIGNAL,
+                callback,
+                std::ptr::null_mut(),
+                None,
+                0,
+            );
+        }
+    }
 }
 
 impl Drop for Device<'_> {
@@ -349,4 +370,32 @@ pub enum Scope {
     Metadata = 1,
     /// Includes parameters (ppid, path, user, started, ...).
     Full = 2,
+}
+
+/// Trait for child process output callbacks
+pub trait OutputListener {
+    /// Invoked whenever the 'output' signal is received
+    fn on_output(pid: u32, fd: i8, data: Vec<u8>);
+}
+
+unsafe extern "C" fn on_output_impl<L: OutputListener>(
+    _device_ptr: *mut _FridaDevice,
+    pid: u32,
+    fd: i8,
+    data: *const _GBytes,
+    _user_data: *mut std::ffi::c_void,
+) {
+    unsafe {
+        let mut raw_data_size: frida_sys::gsize = 0;
+        let raw_data: *const u8 =
+            frida_sys::g_bytes_get_data(data.cast_mut(), std::ptr::from_mut(&mut raw_data_size))
+                as *const u8;
+        let data = if raw_data_size == 0 || raw_data.is_null() {
+            Vec::new()
+        } else {
+            let slice = std::slice::from_raw_parts(raw_data, raw_data_size.try_into().unwrap());
+            slice.to_vec()
+        };
+        <L as OutputListener>::on_output(pid, fd, data);
+    }
 }
