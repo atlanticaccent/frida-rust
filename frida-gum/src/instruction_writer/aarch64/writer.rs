@@ -307,6 +307,38 @@ impl Aarch64InstructionWriter {
     pub fn put_bl_imm(&self, address: u64) -> bool {
         unsafe { gum_sys::gum_arm64_writer_put_bl_imm(self.writer, address) != 0 }
     }
+
+    /// Insert a `movk` instruction (move with keep).
+    ///
+    /// Moves a 16-bit immediate into a register while keeping other bits unchanged.
+    /// Used for building 64-bit constants across multiple instructions.
+    /// Added in Frida 17.16.1.
+    pub fn put_movk_reg_imm(&self, reg: Aarch64Register, imm: u16, shift: u32) -> bool {
+        unsafe {
+            gum_sys::gum_arm64_writer_put_movk_reg_imm(self.writer, reg as u32, imm, shift) != 0
+        }
+    }
+
+    /// Insert a `pacia` instruction (Pointer Authentication Code for Instruction address).
+    ///
+    /// Signs the value in the first register using the second register as context.
+    /// Part of ARMv8.3-A Pointer Authentication (PAC) feature.
+    /// Added in Frida 17.16.1.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use frida_gum::instruction_writer::{Aarch64InstructionWriter, Aarch64Register, InstructionWriter};
+    ///
+    /// let writer = Aarch64InstructionWriter::new(0x1000);
+    /// // Sign x0 using x1 as modifier
+    /// writer.put_pacia_reg_reg(Aarch64Register::X0, Aarch64Register::X1);
+    /// ```
+    pub fn put_pacia_reg_reg(&self, reg: Aarch64Register, modifier: Aarch64Register) -> bool {
+        unsafe {
+            gum_sys::gum_arm64_writer_put_pacia_reg_reg(self.writer, reg as u32, modifier as u32)
+                != 0
+        }
+    }
 }
 
 impl Drop for Aarch64InstructionWriter {
