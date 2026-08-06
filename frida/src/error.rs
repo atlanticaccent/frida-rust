@@ -93,4 +93,15 @@ pub enum Error {
         /// Error message from JavaScript.
         message: String,
     },
+
+    /// Failed to write to target process' stdin
+    #[error("Failed to write to process {pid} stdin, code={code}, message={message}")]
+    DeviceInputFailed {
+        /// Target process' PID
+        pid: u32,
+        /// Error code
+        code: i32,
+        /// Error message
+        message: String,
+    },
 }

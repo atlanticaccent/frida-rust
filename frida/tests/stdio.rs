@@ -1,4 +1,5 @@
 use std::{
+    io::{BufRead, Read},
     sync::{Arc, LazyLock, atomic::AtomicBool},
     thread::sleep,
     time::Duration,
@@ -17,6 +18,21 @@ fn stdout_fixture() {
         sleep(Duration::from_millis(20));
     }
     eprintln!("shutdown");
+}
+
+#[test]
+#[ignore]
+fn stdin_fixture() {
+    let mut buffer = String::new();
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+
+    handle.read_line(&mut buffer).expect("read input");
+    let buffer = buffer.trim();
+
+    eprintln!("{buffer}");
+    std::fs::write(buffer, buffer.len().to_string())
+        .expect("assume input is file path and write input length to new file at path");
 }
 
 #[test]
@@ -96,4 +112,61 @@ fn test_on_output_handler() {
 
     assert!(saw_startup.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!saw_shutdown.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn test_write_stdin() {
+    let dm = DeviceManager::obtain(&FRIDA);
+    let mut device = dm
+        .get_local_device()
+        .expect("local device should be available");
+
+    let executable = std::env::current_exe()
+        .expect("get current executable aka test executable")
+        .display()
+        .to_string();
+
+    let target_pid = device
+        .spawn(
+            &executable,
+            &SpawnOptions::new()
+                .argv([
+                    &executable,
+                    "stdin_fixture",
+                    "--exact",
+                    "--nocapture",
+                    "--ignored",
+                ])
+                .stdio(frida::SpawnStdio::Pipe),
+        )
+        .expect("spawn test");
+
+    // device.on_output(|pid, _fd, output| eprintln!("{pid}: {}", str::from_utf8(output).unwrap()));
+
+    let (mut file, path) = tempfile::NamedTempFile::new()
+        .expect("create named temp file")
+        .into_parts();
+
+    device.resume(target_pid).expect("resume spawned test");
+
+    device
+        .input(target_pid, format!("{}\n", path.display()))
+        .expect("write to target process stdin");
+
+    let mut iterations = 1;
+    while device
+        .enumerate_processes()
+        .into_iter()
+        .any(|process| process.get_pid() == target_pid)
+    {
+        sleep(Duration::from_millis(100 * iterations));
+        assert!(iterations <= 50);
+        iterations += 1
+    }
+
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .expect("read contents of temp file");
+
+    assert_eq!(path.display().to_string().len().to_string(), buf)
 }

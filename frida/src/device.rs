@@ -314,9 +314,10 @@ impl<'a> Device<'a> {
             };
 
             let mut raw_data_size: frida_sys::gsize = 0;
-            let raw_data: *const u8 = unsafe {
+            let raw_data = unsafe {
                 frida_sys::g_bytes_get_data(data.cast_mut(), std::ptr::from_mut(&mut raw_data_size))
-            } as *const u8;
+                    as *const u8
+            };
             let data = if raw_data_size == 0 || raw_data.is_null() {
                 &[]
             } else {
@@ -359,6 +360,35 @@ impl<'a> Device<'a> {
         };
 
         self.on_output_handler_mappings.insert(handler_id, key);
+    }
+
+    ///
+    pub fn input(&mut self, pid: u32, data: impl AsRef<[u8]>) -> Result<()> {
+        let data = data.as_ref();
+        let g_bytes =
+            unsafe { frida_sys::g_bytes_new(data.as_ptr() as _, data.len().try_into().unwrap()) };
+        let mut error: *mut frida_sys::GError = std::ptr::null_mut();
+
+        unsafe {
+            frida_sys::frida_device_input_sync(
+                self.device_ptr as _,
+                pid,
+                g_bytes,
+                std::ptr::null_mut(),
+                &raw mut error,
+            )
+        };
+
+        if !error.is_null() {
+            let message = unsafe { CString::from_raw((*error).message) }
+                .into_string()
+                .map_err(|_| Error::CStringFailed)?;
+            let code = unsafe { (*error).code };
+
+            return Err(Error::DeviceInputFailed { pid, code, message });
+        }
+
+        Ok(())
     }
 }
 
