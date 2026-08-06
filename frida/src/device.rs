@@ -6,10 +6,10 @@
 
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ffi::{CStr, CString},
     marker::PhantomData,
-    sync::{Arc, Mutex, Weak},
+    sync::{LazyLock, Mutex},
 };
 
 use frida_sys::{_FridaDevice, _GBytes};
@@ -19,12 +19,15 @@ use crate::session::Session;
 use crate::variant::Variant;
 use crate::{Error, Result, SpawnOptions};
 
+static ON_OUTPUT_HANDLER_DATA: LazyLock<Mutex<BTreeMap<usize, UserData>>> =
+    LazyLock::new(|| Default::default());
+
 /// Access to a Frida device.
 pub struct Device<'a> {
     pub(crate) device_ptr: *mut _FridaDevice,
     phantom: PhantomData<&'a _FridaDevice>,
 
-    on_output_handler_state: HashMap<std::ffi::c_ulong, Arc<Mutex<UserData>>>,
+    on_output_handler_mappings: HashMap<std::ffi::c_ulong, usize>,
 }
 
 impl<'a> Device<'a> {
@@ -33,7 +36,7 @@ impl<'a> Device<'a> {
             device_ptr,
             phantom: PhantomData,
 
-            on_output_handler_state: HashMap::new(),
+            on_output_handler_mappings: HashMap::new(),
         }
     }
 
@@ -280,39 +283,33 @@ impl<'a> Device<'a> {
     }
 
     ///
-    pub fn on_output(&mut self, mut callback: impl FnMut(u32, i8, &[u8]) + 'static) {
+    pub fn on_output(&mut self, mut callback: impl FnMut(u32, i8, &[u8]) + Send + Sync + 'static) {
         self.on_output_with_context(move |pid, fd, data, _| callback(pid, fd, data), ());
     }
 
     ///
     pub fn on_output_with_context<
-        F: FnMut(u32, i8, &[u8], &mut Context) + 'static,
-        Context: Any,
+        Context: Any + Send + Sync,
+        F: FnMut(u32, i8, &[u8], &mut Context) + Send + Sync + 'static,
     >(
         &mut self,
-        callback: F,
+        mut callback: F,
         context: Context,
     ) {
-        unsafe extern "C" fn on_output_impl<
-            F: FnMut(u32, i8, &[u8], &mut Context) + 'static,
-            Context: Any,
-        >(
+        unsafe extern "C" fn on_output_impl(
             _device_ptr: *mut _FridaDevice,
             pid: u32,
             fd: i8,
             data: *const _GBytes,
             user_data_ptr: *mut std::ffi::c_void,
         ) {
-            let cast = user_data_ptr.cast::<Mutex<UserData>>();
-            let Some(user_data_rc) = unsafe { Weak::from_raw(cast) }.upgrade() else {
-                return;
-            };
-            let user_data: &mut UserData =
-                &mut *user_data_rc.lock().expect("lock on_output handler state");
-            let Some(callback) = user_data.callback.downcast_mut::<F>() else {
-                return;
-            };
-            let Some(context) = user_data.context.downcast_mut::<Context>() else {
+            let shared_state_key = user_data_ptr as usize;
+            let mut shared_handler_data = ON_OUTPUT_HANDLER_DATA
+                .lock()
+                .expect("Lock shared handler data for write");
+            let Some(UserData { callback, context }) =
+                shared_handler_data.get_mut(&shared_state_key)
+            else {
                 return;
             };
 
@@ -326,40 +323,54 @@ impl<'a> Device<'a> {
                 unsafe { std::slice::from_raw_parts(raw_data, raw_data_size.try_into().unwrap()) }
             };
 
-            callback(pid, fd, data, context)
+            callback(pid, fd, data, &mut **context as &mut dyn Any)
         }
 
         const OUTPUT_SIGNAL: *const std::ffi::c_char =
             unsafe { CStr::from_bytes_with_nul_unchecked(b"output\0").as_ptr() };
 
-        let user_data = Arc::new(Mutex::new(UserData {
-            callback: Box::new(callback),
-            context: Box::new(context),
-        }));
-        let user_data_ptr = Weak::into_raw(Arc::downgrade(&user_data));
+        let mut shared_handler_data = ON_OUTPUT_HANDLER_DATA
+            .lock()
+            .expect("Lock shared handler data for write");
+        let key = shared_handler_data
+            .last_key_value()
+            .map(|(k, _)| k + 1)
+            .unwrap_or(0);
+
+        shared_handler_data.insert(
+            key,
+            UserData {
+                callback: Box::new(move |pid, fd, data, context| {
+                    callback(pid, fd, data, context.downcast_mut().unwrap())
+                }),
+                context: Box::new(context),
+            },
+        );
 
         let handler_id = unsafe {
             frida_sys::g_signal_connect_data(
                 self.device_ptr as _,
                 OUTPUT_SIGNAL,
-                Some(std::mem::transmute(
-                    on_output_impl::<F, Context> as *mut std::ffi::c_void,
-                )),
-                user_data_ptr as _,
+                Some(std::mem::transmute(on_output_impl as *const ())),
+                key as _,
                 None,
                 0,
             )
         };
 
-        self.on_output_handler_state.insert(handler_id, user_data);
+        self.on_output_handler_mappings.insert(handler_id, key);
     }
 }
 
 impl Drop for Device<'_> {
     fn drop(&mut self) {
+        let mut on_output_handler_data = ON_OUTPUT_HANDLER_DATA
+            .lock()
+            .expect("lock on_output handler data for cleanup");
         unsafe {
-            for (handler_id, _) in &self.on_output_handler_state {
+            for (handler_id, state_key) in &self.on_output_handler_mappings {
                 frida_sys::g_signal_handler_disconnect(self.device_ptr as _, *handler_id);
+                on_output_handler_data.remove(state_key);
             }
 
             frida_sys::frida_unref(self.device_ptr as _);
@@ -442,6 +453,6 @@ pub enum Scope {
 }
 
 struct UserData {
-    callback: Box<dyn Any>,
-    context: Box<dyn Any>,
+    callback: Box<dyn FnMut(u32, i8, &[u8], &mut dyn Any) + Send + Sync>,
+    context: Box<dyn Any + Send + Sync>,
 }
