@@ -4,10 +4,15 @@
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
+use std::{
+    any::Any,
+    collections::HashMap,
+    ffi::{CStr, CString},
+    marker::PhantomData,
+    sync::{Arc, Mutex, Weak},
+};
+
 use frida_sys::{_FridaDevice, _GBytes};
-use std::ffi::{CStr, CString};
-use std::marker::PhantomData;
-use std::collections::HashMap;
 
 use crate::process::Process;
 use crate::session::Session;
@@ -19,7 +24,7 @@ pub struct Device<'a> {
     pub(crate) device_ptr: *mut _FridaDevice,
     phantom: PhantomData<&'a _FridaDevice>,
 
-    output_contexts: Vec<*mut OutputContext>,
+    on_output_handler_state: HashMap<std::ffi::c_ulong, Arc<Mutex<UserData>>>,
 }
 
 impl<'a> Device<'a> {
@@ -28,7 +33,7 @@ impl<'a> Device<'a> {
             device_ptr,
             phantom: PhantomData,
 
-            output_contexts: Vec::new(),
+            on_output_handler_state: HashMap::new(),
         }
     }
 
@@ -274,41 +279,90 @@ impl<'a> Device<'a> {
         Ok(())
     }
 
-    /// Add child process output listener to the device
-    pub fn add_output_listener<L: OutputListener>(&mut self, _: L) {
+    ///
+    pub fn on_output(&mut self, mut callback: impl FnMut(u32, i8, &[u8]) + 'static) {
+        self.on_output_with_context(move |pid, fd, data, _| callback(pid, fd, data), ());
+    }
+
+    ///
+    pub fn on_output_with_context<
+        F: FnMut(u32, i8, &[u8], &mut Context) + 'static,
+        Context: Any,
+    >(
+        &mut self,
+        callback: F,
+        context: Context,
+    ) {
+        unsafe extern "C" fn on_output_impl<
+            F: FnMut(u32, i8, &[u8], &mut Context) + 'static,
+            Context: Any,
+        >(
+            _device_ptr: *mut _FridaDevice,
+            pid: u32,
+            fd: i8,
+            data: *const _GBytes,
+            user_data_ptr: *mut std::ffi::c_void,
+        ) {
+            let cast = user_data_ptr.cast::<Mutex<UserData>>();
+            let Some(user_data_rc) = unsafe { Weak::from_raw(cast) }.upgrade() else {
+                return;
+            };
+            let user_data: &mut UserData =
+                &mut *user_data_rc.lock().expect("lock on_output handler state");
+            let Some(callback) = user_data.callback.downcast_mut::<F>() else {
+                return;
+            };
+            let Some(context) = user_data.context.downcast_mut::<Context>() else {
+                return;
+            };
+
+            let mut raw_data_size: frida_sys::gsize = 0;
+            let raw_data: *const u8 = unsafe {
+                frida_sys::g_bytes_get_data(data.cast_mut(), std::ptr::from_mut(&mut raw_data_size))
+            } as *const u8;
+            let data = if raw_data_size == 0 || raw_data.is_null() {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(raw_data, raw_data_size.try_into().unwrap()) }
+            };
+
+            callback(pid, fd, data, context)
+        }
+
         const OUTPUT_SIGNAL: *const std::ffi::c_char =
             unsafe { CStr::from_bytes_with_nul_unchecked(b"output\0").as_ptr() };
 
-        unsafe {
-            let callback = Some(std::mem::transmute(
-                on_output_impl::<L> as *mut std::ffi::c_void,
-            ));
+        let user_data = Arc::new(Mutex::new(UserData {
+            callback: Box::new(callback),
+            context: Box::new(context),
+        }));
+        let user_data_ptr = Weak::into_raw(Arc::downgrade(&user_data));
 
-            let user_data: Box<OutputContext> = Box::new(OutputContext::new(Default::default()));
-            let user_data_ptr = Box::into_raw(user_data);
-            self.output_contexts.push(user_data_ptr);
-
+        let handler_id = unsafe {
             frida_sys::g_signal_connect_data(
                 self.device_ptr as _,
                 OUTPUT_SIGNAL,
-                callback,
-                std::mem::transmute(user_data_ptr),
+                Some(std::mem::transmute(
+                    on_output_impl::<F, Context> as *mut std::ffi::c_void,
+                )),
+                user_data_ptr as _,
                 None,
                 0,
-            );
-        }
+            )
+        };
+
+        self.on_output_handler_state.insert(handler_id, user_data);
     }
 }
 
 impl Drop for Device<'_> {
     fn drop(&mut self) {
         unsafe {
+            for (handler_id, _) in &self.on_output_handler_state {
+                frida_sys::g_signal_handler_disconnect(self.device_ptr as _, *handler_id);
+            }
+
             frida_sys::frida_unref(self.device_ptr as _);
-            let _ = self
-                .output_contexts
-                .drain(..)
-                .map(|ptr| Box::from_raw(ptr))
-                .collect::<Vec<_>>();
         };
     }
 }
@@ -387,42 +441,7 @@ pub enum Scope {
     Full = 2,
 }
 
-/// Trait for child process output callbacks
-pub trait OutputListener {
-    /// Invoked whenever the 'output' signal is received
-    fn on_output(pid: u32, fd: i8, data: Vec<u8>);
-
-    /// Invoked whenever the 'output' signal is received but with a context shared across invocations
-    ///
-    /// By default calls into the simpler [`Self::on_output`]
-    fn on_output_with_context(pid: u32, fd: i8, data: Vec<u8>, _context: &mut OutputContext) {
-        Self::on_output(pid, fd, data);
-    }
-}
-
-type OutputContext = std::io::LineWriter<std::io::Cursor<Vec<u8>>>;
-
-unsafe extern "C" fn on_output_impl<L: OutputListener>(
-    _device_ptr: *mut _FridaDevice,
-    pid: u32,
-    fd: i8,
-    data: *const _GBytes,
-    user_data_ptr: *mut std::ffi::c_void,
-) {
-    unsafe {
-        let user_data_ptr: *mut OutputContext = std::mem::transmute(user_data_ptr.cast_const());
-        let user_data = user_data_ptr.as_mut().unwrap();
-
-        let mut raw_data_size: frida_sys::gsize = 0;
-        let raw_data: *const u8 =
-            frida_sys::g_bytes_get_data(data.cast_mut(), std::ptr::from_mut(&mut raw_data_size))
-                as *const u8;
-        let data = if raw_data_size == 0 || raw_data.is_null() {
-            Vec::new()
-        } else {
-            let slice = std::slice::from_raw_parts(raw_data, raw_data_size.try_into().unwrap());
-            slice.to_vec()
-        };
-        <L as OutputListener>::on_output_with_context(pid, fd, data, user_data);
-    }
+struct UserData {
+    callback: Box<dyn Any>,
+    context: Box<dyn Any>,
 }
