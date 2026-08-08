@@ -77,7 +77,7 @@ fn test_on_output_handler() {
                     thread.name(),
                     str::from_utf8(data).unwrap()
                 );
-                if pid == target_pid {
+                if target_pid == pid {
                     let output = str::from_utf8(data).unwrap().trim();
                     if output == "startup" {
                         saw_startup.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -99,16 +99,7 @@ fn test_on_output_handler() {
 
     let device = dm.get_local_device().expect("get new local device");
 
-    let mut iterations = 1;
-    while device
-        .enumerate_processes()
-        .into_iter()
-        .any(|process| process.get_pid() == target_pid)
-    {
-        sleep(Duration::from_millis(100 * iterations));
-        assert!(iterations <= 50);
-        iterations += 1
-    }
+    poll_process_termination(device, target_pid);
 
     assert!(saw_startup.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!saw_shutdown.load(std::sync::atomic::Ordering::Relaxed));
@@ -153,20 +144,30 @@ fn test_write_stdin() {
         .input(target_pid, format!("{}\n", path.display()))
         .expect("write to target process stdin");
 
-    let mut iterations = 1;
-    while device
-        .enumerate_processes()
-        .into_iter()
-        .any(|process| process.get_pid() == target_pid)
-    {
-        sleep(Duration::from_millis(100 * iterations));
-        assert!(iterations <= 50);
-        iterations += 1
-    }
+    poll_process_termination(device, target_pid);
 
     let mut buf = String::new();
     file.read_to_string(&mut buf)
         .expect("read contents of temp file");
 
     assert_eq!(path.display().to_string().len().to_string(), buf)
+}
+
+fn poll_process_termination(device: frida::Device<'_>, target_pid: frida::SpawnedPid) {
+    const MAX_RETRIES: u32 = 50;
+
+    let mut iterations = 1;
+    while device
+        .enumerate_processes()
+        .into_iter()
+        .any(|process| target_pid == process.get_pid())
+    {
+        sleep(Duration::from_millis(10 * 2_u64.pow(iterations)));
+        assert!(
+            iterations <= MAX_RETRIES,
+            "process {} still running after {MAX_RETRIES} retries",
+            *target_pid
+        );
+        iterations += 1
+    }
 }

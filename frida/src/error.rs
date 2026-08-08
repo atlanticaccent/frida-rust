@@ -95,12 +95,12 @@ pub enum Error {
     },
 
     /// Failed to write to target process' stdin
-    #[error("Failed to write to process {pid} stdin, code={code}, message={message}")]
+    #[error("Failed to write to process {pid} stdin, code={code:?}, message={message}")]
     DeviceInputFailed {
         /// Target process' PID
         pid: u32,
         /// Error code
-        code: i32,
+        code: Option<i32>,
         /// Error message
         message: String,
     },

@@ -1,4 +1,4 @@
-use crate::{Device, Error, Result};
+use crate::{Device, Error, PidLike, Result};
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -102,38 +102,9 @@ pub trait Inject {
     ///
     /// Inject the library at `path` on the target device into the process identified by `pid`.
     /// On injection, the given entrypoint is executed and passed the string in `data`.
-    fn inject_library_file_sync<D, E, P>(
+    fn inject_library_file_sync<D, E, P, Pid>(
         &mut self,
-        pid: u32,
-        path: P,
-        entrypoint: E,
-        data: D,
-    ) -> Result<u32>
-    where
-        D: Into<Vec<u8>>,
-        P: AsRef<Path>,
-        E: AsRef<str>;
-
-    /// Inject a library blob into a target process
-    ///
-    /// Inject the library given in `blob` into the process identified by `pid`.
-    /// On injection, the given entrypoint is executed and passed the string in `data`.
-    fn inject_library_blob_sync<D, E>(
-        &mut self,
-        pid: u32,
-        blob: &[u8],
-        entrypoint: E,
-        data: D,
-    ) -> Result<u32>
-    where
-        D: Into<Vec<u8>>,
-        E: AsRef<str>;
-}
-
-impl Inject for Injector<'_> {
-    fn inject_library_file_sync<D, E, P>(
-        &mut self,
-        pid: u32,
+        pid: Pid,
         path: P,
         entrypoint: E,
         data: D,
@@ -142,6 +113,38 @@ impl Inject for Injector<'_> {
         D: Into<Vec<u8>>,
         P: AsRef<Path>,
         E: AsRef<str>,
+        Pid: PidLike;
+
+    /// Inject a library blob into a target process
+    ///
+    /// Inject the library given in `blob` into the process identified by `pid`.
+    /// On injection, the given entrypoint is executed and passed the string in `data`.
+    fn inject_library_blob_sync<D, E, Pid>(
+        &mut self,
+        pid: Pid,
+        blob: &[u8],
+        entrypoint: E,
+        data: D,
+    ) -> Result<u32>
+    where
+        D: Into<Vec<u8>>,
+        E: AsRef<str>,
+        Pid: PidLike;
+}
+
+impl Inject for Injector<'_> {
+    fn inject_library_file_sync<D, E, P, Pid>(
+        &mut self,
+        pid: Pid,
+        path: P,
+        entrypoint: E,
+        data: D,
+    ) -> Result<u32>
+    where
+        D: Into<Vec<u8>>,
+        P: AsRef<Path>,
+        E: AsRef<str>,
+        Pid: PidLike,
     {
         #[cfg(unix)]
         let path =
@@ -164,7 +167,7 @@ impl Inject for Injector<'_> {
         let id = unsafe {
             frida_sys::frida_injector_inject_library_file_sync(
                 self.injector_ptr,
-                pid as frida_sys::guint,
+                pid.into_u32() as frida_sys::guint,
                 path.as_ptr() as *const frida_sys::gchar,
                 entrypoint.as_ptr() as *const frida_sys::gchar,
                 data.as_ptr() as *const frida_sys::gchar,
@@ -184,9 +187,9 @@ impl Inject for Injector<'_> {
         Ok(id)
     }
 
-    fn inject_library_blob_sync<D, E>(
+    fn inject_library_blob_sync<D, E, Pid>(
         &mut self,
-        pid: u32,
+        pid: Pid,
         blob: &[u8],
         entrypoint: E,
         data: D,
@@ -194,6 +197,7 @@ impl Inject for Injector<'_> {
     where
         D: Into<Vec<u8>>,
         E: AsRef<str>,
+        Pid: PidLike,
     {
         let entrypoint = CString::new(entrypoint.as_ref()).unwrap();
 
@@ -204,7 +208,7 @@ impl Inject for Injector<'_> {
             let g_blob = g_bytes_new(blob.as_ptr() as _, blob.len() as _);
             let id = frida_sys::frida_injector_inject_library_blob_sync(
                 self.injector_ptr,
-                pid,
+                pid.into_u32(),
                 g_blob,
                 entrypoint.as_ptr() as *const frida_sys::gchar,
                 data.as_ptr() as *const frida_sys::gchar,
@@ -229,9 +233,9 @@ impl Inject for Injector<'_> {
 }
 
 impl Inject for Device<'_> {
-    fn inject_library_file_sync<D, E, P>(
+    fn inject_library_file_sync<D, E, P, Pid>(
         &mut self,
-        pid: u32,
+        pid: Pid,
         path: P,
         entrypoint: E,
         data: D,
@@ -240,6 +244,7 @@ impl Inject for Device<'_> {
         D: Into<Vec<u8>>,
         P: AsRef<Path>,
         E: AsRef<str>,
+        Pid: PidLike,
     {
         #[cfg(unix)]
         let path =
@@ -262,7 +267,7 @@ impl Inject for Device<'_> {
         let id = unsafe {
             frida_sys::frida_device_inject_library_file_sync(
                 self.device_ptr,
-                pid as frida_sys::guint,
+                pid.into_u32() as frida_sys::guint,
                 path.as_ptr() as *const frida_sys::gchar,
                 entrypoint.as_ptr() as *const frida_sys::gchar,
                 data.as_ptr() as *const frida_sys::gchar,
@@ -282,9 +287,9 @@ impl Inject for Device<'_> {
         Ok(id)
     }
 
-    fn inject_library_blob_sync<D, E>(
+    fn inject_library_blob_sync<D, E, Pid>(
         &mut self,
-        pid: u32,
+        pid: Pid,
         blob: &[u8],
         entrypoint: E,
         data: D,
@@ -292,6 +297,7 @@ impl Inject for Device<'_> {
     where
         D: Into<Vec<u8>>,
         E: AsRef<str>,
+        Pid: PidLike,
     {
         let entrypoint = CString::new(entrypoint.as_ref()).unwrap();
 
@@ -302,7 +308,7 @@ impl Inject for Device<'_> {
             let g_blob = g_bytes_new(blob.as_ptr() as _, blob.len() as _);
             let id = frida_sys::frida_device_inject_library_blob_sync(
                 self.device_ptr,
-                pid,
+                pid.into_u32(),
                 g_blob,
                 entrypoint.as_ptr() as *const frida_sys::gchar,
                 data.as_ptr() as *const frida_sys::gchar,

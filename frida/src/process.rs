@@ -88,6 +88,8 @@ pub enum SpawnStdio {
 pub struct SpawnOptions<'a> {
     pub(crate) options_ptr: *mut FridaSpawnOptions,
     phantom: PhantomData<&'a FridaSpawnOptions>,
+
+    pub(crate) spawn_stdio: SpawnStdio,
 }
 
 impl SpawnOptions<'_> {
@@ -95,6 +97,8 @@ impl SpawnOptions<'_> {
         Self {
             options_ptr,
             phantom: PhantomData,
+
+            spawn_stdio: SpawnStdio::Inherit,
         }
     }
 
@@ -184,7 +188,8 @@ impl SpawnOptions<'_> {
     }
 
     /// Set the Standard I/O handling
-    pub fn stdio(self, stdio: SpawnStdio) -> Self {
+    pub fn stdio(mut self, stdio: SpawnStdio) -> Self {
+        self.spawn_stdio = stdio;
         unsafe { frida_sys::frida_spawn_options_set_stdio(self.options_ptr, stdio as _) }
         self
     }

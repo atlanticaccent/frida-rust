@@ -9,15 +9,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CStr, CString},
     marker::PhantomData,
+    ops::Deref,
     sync::{LazyLock, Mutex},
 };
 
 use frida_sys::{_FridaDevice, _GBytes};
 
-use crate::process::Process;
-use crate::session::Session;
-use crate::variant::Variant;
-use crate::{Error, Result, SpawnOptions};
+use crate::{
+    Error, Result, SpawnOptions, SpawnStdio, process::Process, session::Session, variant::Variant,
+};
 
 static ON_OUTPUT_HANDLER_DATA: LazyLock<Mutex<BTreeMap<usize, UserData>>> =
     LazyLock::new(|| Default::default());
@@ -181,10 +181,12 @@ impl<'a> Device<'a> {
     }
 
     /// Creates [`Session`] and attaches the device to the current PID.
-    pub fn attach<'b>(&'a self, pid: u32) -> Result<Session<'b>>
+    pub fn attach<'b>(&'a self, pid: impl PidLike) -> Result<Session<'b>>
     where
         'a: 'b,
     {
+        let pid = pid.into_u32();
+
         let mut error: *mut frida_sys::GError = std::ptr::null_mut();
         let session = unsafe {
             frida_sys::frida_device_attach_sync(
@@ -208,7 +210,11 @@ impl<'a> Device<'a> {
     /// Returns the PID of the newly spawned process.
     /// On spawn, the process will be halted, and [`resume`](Device::resume) will need to be
     /// called to continue execution.
-    pub fn spawn<S: AsRef<str>>(&mut self, program: S, options: &SpawnOptions) -> Result<u32> {
+    pub fn spawn<S: AsRef<str>>(
+        &mut self,
+        program: S,
+        options: &SpawnOptions,
+    ) -> Result<SpawnedPid> {
         let mut error: *mut frida_sys::GError = std::ptr::null_mut();
         let program = CString::new(program.as_ref()).unwrap();
 
@@ -231,11 +237,15 @@ impl<'a> Device<'a> {
             return Err(Error::SpawnFailed { code, message });
         }
 
-        Ok(pid)
+        Ok(match options.spawn_stdio {
+            SpawnStdio::Inherit => SpawnedPid::InheritedStdio(pid),
+            SpawnStdio::Pipe => SpawnedPid::PipedStdio(pid),
+        })
     }
 
     /// Resumes the process with given pid.
-    pub fn resume(&self, pid: u32) -> Result<()> {
+    pub fn resume(&self, pid: impl PidLike) -> Result<()> {
+        let pid = pid.into_u32();
         let mut error: *mut frida_sys::GError = std::ptr::null_mut();
         unsafe {
             frida_sys::frida_device_resume_sync(
@@ -363,7 +373,18 @@ impl<'a> Device<'a> {
     }
 
     ///
-    pub fn input(&mut self, pid: u32, data: impl AsRef<[u8]>) -> Result<()> {
+    pub fn input(&self, pid: SpawnedPid, data: impl AsRef<[u8]>) -> Result<()> {
+        let pid = match pid {
+            SpawnedPid::InheritedStdio(pid) | SpawnedPid::Unknown(pid) => {
+                return Err(Error::DeviceInputFailed {
+                    pid,
+                    code: None,
+                    message: "process must be spawned with piped stdio".to_owned(),
+                });
+            }
+            SpawnedPid::PipedStdio(pid) => pid,
+        };
+
         let data = data.as_ref();
         let g_bytes =
             unsafe { frida_sys::g_bytes_new(data.as_ptr() as _, data.len().try_into().unwrap()) };
@@ -385,7 +406,11 @@ impl<'a> Device<'a> {
                 .map_err(|_| Error::CStringFailed)?;
             let code = unsafe { (*error).code };
 
-            return Err(Error::DeviceInputFailed { pid, code, message });
+            return Err(Error::DeviceInputFailed {
+                pid,
+                code: Some(code),
+                message,
+            });
         }
 
         Ok(())
@@ -485,4 +510,67 @@ pub enum Scope {
 struct UserData {
     callback: Box<dyn FnMut(u32, i8, &[u8], &mut dyn Any) + Send + Sync>,
     context: Box<dyn Any + Send + Sync>,
+}
+
+/// PID of a process spawned by calling [Device::spawn].
+/// Primarily exists to ensure [Device::input] only targets processes spawned
+/// by [Device::spawn] with stdio routing set to [SpawnStdio::Pipe].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnedPid {
+    /// This process inherited its parent's stdio handles
+    InheritedStdio(u32),
+    /// This process is using pipes for stdio
+    PipedStdio(u32),
+    /// It's unknown how this process' stdio is being handled
+    Unknown(u32),
+}
+
+impl Deref for SpawnedPid {
+    type Target = u32;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            SpawnedPid::InheritedStdio(pid) => pid,
+            SpawnedPid::PipedStdio(pid) => pid,
+            SpawnedPid::Unknown(pid) => pid,
+        }
+    }
+}
+
+impl From<SpawnedPid> for u32 {
+    fn from(value: SpawnedPid) -> Self {
+        *value
+    }
+}
+
+impl PartialEq<u32> for SpawnedPid {
+    fn eq(&self, other: &u32) -> bool {
+        **self == *other
+    }
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// Convenience trait to allow accepting _only_ plain [u32]s or [SpawnedPid]s.
+pub trait PidLike: private::Sealed {
+    ///
+    fn into_u32(self) -> u32;
+}
+
+impl private::Sealed for u32 {}
+
+impl PidLike for u32 {
+    fn into_u32(self) -> u32 {
+        self
+    }
+}
+
+impl private::Sealed for SpawnedPid {}
+
+impl PidLike for SpawnedPid {
+    fn into_u32(self) -> u32 {
+        *self
+    }
 }
